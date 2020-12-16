@@ -10,7 +10,7 @@ Yolo_Insulators是一个基于YoloV4的绝缘子目标检测程序，人工智�
 - Pytorch1.2.0
 - CUDA10.0
 
-### 二、Yolo算法简介 [转](https://baijiahao.baidu.com/s?id=1664853943386329436&wfr=spider&for=pc)
+### 二、Yolo算法简介
 
 “You Only Look Once”或“YOLO”是一个对象检测算法的名字，这是Redmon等人在2016年的一篇研究论文中命名的。YOLO实现了自动驾驶汽车等前沿技术中使用的实时对象检测。让我们看看是什么使该算法如此受欢迎，并概述其工作原理。
 
