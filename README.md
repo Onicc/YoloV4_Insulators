@@ -94,138 +94,26 @@ YoloV4基本网络结构如下：
 
 YoloV4整个网络主要分为CSPDarknet53、SPP、PANet和Yolo Head四个部分。
 
-**CSPDarknet53**：主干特征提取网络，主要利用深度卷积提取图像特征，便于后续网络使用。代码主要在`nets\CSPdarknet.py`下，以下为CSPDarknet53网络结构的代码。
+**CSPDarknet53**：主干特征提取网络，主要利用深度卷积提取图像特征，便于后续网络使用。代码主要在`nets\CSPdarknet.py`下，以下为CSPDarknet53网络结构的类。
 
 ```python
-class CSPDarkNet(nn.Module):
-    def __init__(self, layers):
-        super(CSPDarkNet, self).__init__()
-        self.inplanes = 32
-        self.conv1 = BasicConv(3, self.inplanes, kernel_size=3, stride=1)
-        self.feature_channels = [64, 128, 256, 512, 1024]
-
-        self.stages = nn.ModuleList([
-            Resblock_body(self.inplanes, self.feature_channels[0], layers[0], first=True),
-            Resblock_body(self.feature_channels[0], self.feature_channels[1], layers[1], first=False),
-            Resblock_body(self.feature_channels[1], self.feature_channels[2], layers[2], first=False),
-            Resblock_body(self.feature_channels[2], self.feature_channels[3], layers[3], first=False),
-            Resblock_body(self.feature_channels[3], self.feature_channels[4], layers[4], first=False)
-        ])
-
-        self.num_features = 1
-        # 进行权值初始化
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-
-
-    def forward(self, x):
-        x = self.conv1(x)
-
-        x = self.stages[0](x)
-        x = self.stages[1](x)
-        out3 = self.stages[2](x)
-        out4 = self.stages[3](out3)
-        out5 = self.stages[4](out4)
-
-        return out3, out4, out5
+class CSPDarkNet(nn.Module)
 ```
 
 在`forward`部分可以看到输入图像经过一次普通卷积和五次残差卷积，最后将倒数三层结果输出，供给后面网络使用。这样可以提取不同尺度的特征信息，方便后续的特征融合及提取。值得注意的是
 
-**SPP**：加强特征提取网络的一部分，主要是使用不同池化核进行最大池化，再进行多重感受野融合。以下为SPP网络部分代码。
+**SPP**：加强特征提取网络的一部分，主要是使用不同池化核进行最大池化，再进行多重感受野融合。以下为SPP网络部分的类。
 
 ```python
-class SpatialPyramidPooling(nn.Module):
-    def __init__(self, pool_sizes=[5, 9, 13]):
-        super(SpatialPyramidPooling, self).__init__()
-
-        self.maxpools = nn.ModuleList([nn.MaxPool2d(pool_size, 1, pool_size//2) for pool_size in pool_sizes])
-
-    def forward(self, x):
-        features = [maxpool(x) for maxpool in self.maxpools[::-1]]
-        features = torch.cat(features + [x], dim=1)
-
-        return features
+class SpatialPyramidPooling(nn.Module)
 ```
 
 采用三种不同的池化核对输入特征层池化，得到不同感受野的特征层，最后融合所有输出层及输入层实现多重感受野的融合。
 
-**PANet+Yolo Head**：加强特征提取网络的一部分和网络输出，主要对上两个网络输出的不同尺度的特征进行上下采样特征融合，最后在三种不同的尺度上对预测的结果输出，以下为PANet和YoloHead的代码。
+**PANet+Yolo Head**：加强特征提取网络的一部分和网络输出，主要对上两个网络输出的不同尺度的特征进行上下采样特征融合，最后在三种不同的尺度上对预测的结果输出，以下为PANet和YoloHead的类。
 
 ```python
-class YoloBody(nn.Module):
-    def __init__(self, num_anchors, num_classes):
-        super(YoloBody, self).__init__()
-        # backbone
-        self.backbone = darknet53(None)
-
-        # SPP
-        self.conv1 = make_three_conv([512,1024],1024)
-        self.SPP = SpatialPyramidPooling()
-        self.conv2 = make_three_conv([512,1024],2048)
-
-        self.upsample1 = Upsample(512,256)
-        self.conv_for_P4 = conv2d(512,256,1)
-        self.make_five_conv1 = make_five_conv([256, 512],512)
-
-        self.upsample2 = Upsample(256,128)
-        self.conv_for_P3 = conv2d(256,128,1)
-        self.make_five_conv2 = make_five_conv([128, 256],256)
-        # 3*(5+num_classes)=3*(5+20)=3*(4+1+20)=75
-        # 4+1+num_classes
-        final_out_filter2 = num_anchors * (5 + num_classes)
-        self.yolo_head3 = yolo_head([256, final_out_filter2],128)
-
-        self.down_sample1 = conv2d(128,256,3,stride=2)
-        self.make_five_conv3 = make_five_conv([256, 512],512)
-        # 3*(5+num_classes)=3*(5+20)=3*(4+1+20)=75
-        final_out_filter1 =  num_anchors * (5 + num_classes)
-        self.yolo_head2 = yolo_head([512, final_out_filter1],256)
-
-
-        self.down_sample2 = conv2d(256,512,3,stride=2)
-        self.make_five_conv4 = make_five_conv([512, 1024],1024)
-        # 3*(5+num_classes)=3*(5+20)=3*(4+1+20)=75
-        final_out_filter0 =  num_anchors * (5 + num_classes)
-        self.yolo_head1 = yolo_head([1024, final_out_filter0],512)
-
-
-    def forward(self, x):
-        #  backbone
-        x2, x1, x0 = self.backbone(x)
-
-        P5 = self.conv1(x0)
-        P5 = self.SPP(P5)
-        P5 = self.conv2(P5)
-
-        P5_upsample = self.upsample1(P5)
-        P4 = self.conv_for_P4(x1)
-        P4 = torch.cat([P4,P5_upsample],axis=1)
-        P4 = self.make_five_conv1(P4)
-
-        P4_upsample = self.upsample2(P4)
-        P3 = self.conv_for_P3(x2)
-        P3 = torch.cat([P3,P4_upsample],axis=1)
-        P3 = self.make_five_conv2(P3)
-
-        P3_downsample = self.down_sample1(P3)
-        P4 = torch.cat([P3_downsample,P4],axis=1)
-        P4 = self.make_five_conv3(P4)
-
-        P4_downsample = self.down_sample2(P4)
-        P5 = torch.cat([P4_downsample,P5],axis=1)
-        P5 = self.make_five_conv4(P5)
-
-        out2 = self.yolo_head3(P3)
-        out1 = self.yolo_head2(P4)
-        out0 = self.yolo_head1(P5)
-
-        return out0, out1, out2
+class YoloBody(nn.Module)
 ```
 
 输入的`x2`,`x1`,`x0`为`CSPDarknet53`和`SPP`网络的输出，分别代表着三个不同尺度的特征层，在`PANet`中将这三个不同尺度的特征通过上下采样，使其在大小上具有相同的尺度，再进行特征融合，依次在三个不同尺度下进行，最后通过卷积将结果输出，值得注意的是yolo的输出既包含回归也包含分类，其中在不同物体识别上是采用分类的方式，在预测物体所在位置时采用回归的方式。
