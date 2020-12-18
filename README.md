@@ -50,26 +50,189 @@ YOLO将对象检测重新定义为一个回归问题。它将单个卷积神经�
 
 YOLO非常快。由于检测问题是一个回归问题，所以不需要复杂的管道。它比“R-CNN”快1000倍，比“Fast R-CNN”快100倍。它能够处理实时视频流，延迟小于25毫秒。它的精度是以前实时系统的两倍多。同样重要的是，YOLO遵循的是“端到端深度学习”的实践。
 
-### 三、文件结构
+### 三、代码说明
+
+#### 1、文件结构
 
 ```
 .
+│  predict.py				# 对图片进行预测
+│  train.py					# 训练模型
+│  voc_annotation.py		# 对VOC数据集处理导出索引
+│  yolo.py					# 预测程序的子程序
+│  
 ├─img						# 存放预测后的图像
 ├─logs						# 存放训练的模型文件
 ├─model_data				# 存放预训练模型
+│      new_classes.txt		# 类别的名称
+│      yolo_anchors.txt		# 先验框的大小
+│      
 ├─nets						# 网络结构
+│      CSPdarknet.py		# CSPdarkNet53主干特征网络
+│      yolo4.py				# FPN、SPP等网络
+│      yolo_training.py		# 模型训练子程序
+│      
 ├─utils						# 数据加载、NMS等
-├─VOCdevkit					# VOC数据集
-   └─VOC2007
-       ├─Annotations		# 标注XML文件
-       ├─ImageSets			
-       │  └─Main
-       └─JPEGImages			# 数据集图片
+│      dataloader.py		# 数据加载
+│      utils.py				# 数据处理、增强等
+│      
+└─VOCdevkit					# VOC数据集
+    └─VOC2007
+        │  voc2yolo4.py		# 数据集转换
+        │  
+        ├─Annotations		# 标注XML文件
+        ├─ImageSets
+        │  └─Main
+        └─JPEGImages		# 数据集图片
 ```
 
+#### 2、基本原理
+
+YoloV4基本网络结构如下：
+
+![20200512144007178](../../YoloV4_Insulators/.assets/20200512144007178.png)
+
+YoloV4整个网络主要分为CSPDarknet53、SPP、PANet和Yolo Head四个部分。
+
+**CSPDarknet53**：主干特征提取网络，主要利用深度卷积提取图像特征，便于后续网络使用。代码主要在`nets\CSPdarknet.py`下，以下为CSPDarknet53网络结构的代码。
+
+```python
+class CSPDarkNet(nn.Module):
+    def __init__(self, layers):
+        super(CSPDarkNet, self).__init__()
+        self.inplanes = 32
+        self.conv1 = BasicConv(3, self.inplanes, kernel_size=3, stride=1)
+        self.feature_channels = [64, 128, 256, 512, 1024]
+
+        self.stages = nn.ModuleList([
+            Resblock_body(self.inplanes, self.feature_channels[0], layers[0], first=True),
+            Resblock_body(self.feature_channels[0], self.feature_channels[1], layers[1], first=False),
+            Resblock_body(self.feature_channels[1], self.feature_channels[2], layers[2], first=False),
+            Resblock_body(self.feature_channels[2], self.feature_channels[3], layers[3], first=False),
+            Resblock_body(self.feature_channels[3], self.feature_channels[4], layers[4], first=False)
+        ])
+
+        self.num_features = 1
+        # 进行权值初始化
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
 
 
-### 三、数据集
+    def forward(self, x):
+        x = self.conv1(x)
+
+        x = self.stages[0](x)
+        x = self.stages[1](x)
+        out3 = self.stages[2](x)
+        out4 = self.stages[3](out3)
+        out5 = self.stages[4](out4)
+
+        return out3, out4, out5
+```
+
+在`forward`部分可以看到输入图像经过一次普通卷积和五次残差卷积，最后将倒数三层结果输出，供给后面网络使用。这样可以提取不同尺度的特征信息，方便后续的特征融合及提取。值得注意的是
+
+**SPP**：加强特征提取网络的一部分，主要是使用不同池化核进行最大池化，再进行多重感受野融合。以下为SPP网络部分代码。
+
+```python
+class SpatialPyramidPooling(nn.Module):
+    def __init__(self, pool_sizes=[5, 9, 13]):
+        super(SpatialPyramidPooling, self).__init__()
+
+        self.maxpools = nn.ModuleList([nn.MaxPool2d(pool_size, 1, pool_size//2) for pool_size in pool_sizes])
+
+    def forward(self, x):
+        features = [maxpool(x) for maxpool in self.maxpools[::-1]]
+        features = torch.cat(features + [x], dim=1)
+
+        return features
+```
+
+采用三种不同的池化核对输入特征层池化，得到不同感受野的特征层，最后融合所有输出层及输入层实现多重感受野的融合。
+
+**PANet+Yolo Head**：加强特征提取网络的一部分和网络输出，主要对上两个网络输出的不同尺度的特征进行上下采样特征融合，最后在三种不同的尺度上对预测的结果输出，以下为PANet和YoloHead的代码。
+
+```python
+class YoloBody(nn.Module):
+    def __init__(self, num_anchors, num_classes):
+        super(YoloBody, self).__init__()
+        # backbone
+        self.backbone = darknet53(None)
+
+        # SPP
+        self.conv1 = make_three_conv([512,1024],1024)
+        self.SPP = SpatialPyramidPooling()
+        self.conv2 = make_three_conv([512,1024],2048)
+
+        self.upsample1 = Upsample(512,256)
+        self.conv_for_P4 = conv2d(512,256,1)
+        self.make_five_conv1 = make_five_conv([256, 512],512)
+
+        self.upsample2 = Upsample(256,128)
+        self.conv_for_P3 = conv2d(256,128,1)
+        self.make_five_conv2 = make_five_conv([128, 256],256)
+        # 3*(5+num_classes)=3*(5+20)=3*(4+1+20)=75
+        # 4+1+num_classes
+        final_out_filter2 = num_anchors * (5 + num_classes)
+        self.yolo_head3 = yolo_head([256, final_out_filter2],128)
+
+        self.down_sample1 = conv2d(128,256,3,stride=2)
+        self.make_five_conv3 = make_five_conv([256, 512],512)
+        # 3*(5+num_classes)=3*(5+20)=3*(4+1+20)=75
+        final_out_filter1 =  num_anchors * (5 + num_classes)
+        self.yolo_head2 = yolo_head([512, final_out_filter1],256)
+
+
+        self.down_sample2 = conv2d(256,512,3,stride=2)
+        self.make_five_conv4 = make_five_conv([512, 1024],1024)
+        # 3*(5+num_classes)=3*(5+20)=3*(4+1+20)=75
+        final_out_filter0 =  num_anchors * (5 + num_classes)
+        self.yolo_head1 = yolo_head([1024, final_out_filter0],512)
+
+
+    def forward(self, x):
+        #  backbone
+        x2, x1, x0 = self.backbone(x)
+
+        P5 = self.conv1(x0)
+        P5 = self.SPP(P5)
+        P5 = self.conv2(P5)
+
+        P5_upsample = self.upsample1(P5)
+        P4 = self.conv_for_P4(x1)
+        P4 = torch.cat([P4,P5_upsample],axis=1)
+        P4 = self.make_five_conv1(P4)
+
+        P4_upsample = self.upsample2(P4)
+        P3 = self.conv_for_P3(x2)
+        P3 = torch.cat([P3,P4_upsample],axis=1)
+        P3 = self.make_five_conv2(P3)
+
+        P3_downsample = self.down_sample1(P3)
+        P4 = torch.cat([P3_downsample,P4],axis=1)
+        P4 = self.make_five_conv3(P4)
+
+        P4_downsample = self.down_sample2(P4)
+        P5 = torch.cat([P4_downsample,P5],axis=1)
+        P5 = self.make_five_conv4(P5)
+
+        out2 = self.yolo_head3(P3)
+        out1 = self.yolo_head2(P4)
+        out0 = self.yolo_head1(P5)
+
+        return out0, out1, out2
+```
+
+输入的`x2`,`x1`,`x0`为`CSPDarknet53`和`SPP`网络的输出，分别代表着三个不同尺度的特征层，在`PANet`中将这三个不同尺度的特征通过上下采样，使其在大小上具有相同的尺度，再进行特征融合，依次在三个不同尺度下进行，最后通过卷积将结果输出，值得注意的是yolo的输出既包含回归也包含分类，其中在不同物体识别上是采用分类的方式，在预测物体所在位置时采用回归的方式。
+
+### 四，如何使用
+
+#### 1、数据集
 
 数据集采用网上开源的绝缘子数据集，共600张图片。数据集格式使用VOC2007，标注文件为xml。
 
@@ -79,7 +242,7 @@ YOLO非常快。由于检测问题是一个回归问题，所以不需要复杂�
 
 若需要扩增自己的数据，可以使用[labelimg](https://github.com/tzutalin/labelImg)来标注新的数据，注意标签为insulator。
 
-#### 如何制作数据集
+**如何制作数据集**
 
 将数据集图片存放至`VOCdevkit/VOC2007/JPEGImages`目录，再将标注文件放至`VOCdevkit/VOC2007/Anootations`目录。
 
@@ -92,7 +255,7 @@ python voc_annotation.py
 
 运行成功后会在`VOCdevkit/VOC2007/ImageSets/Main`目录生成训练需要的文件。
 
-### 四、训练模型
+#### 2、训练模型
 
 由于数据集数量较小，直接训练模型收敛效果可能不佳，达不到高识别率。绝缘子识别是目标检测的一个子应用，其模型的很多参数与其他目标检测的参数相似，因此可以通过一个在完备的数据集上训练好的模型通过迁移学习应用到绝缘子识别上，可以在数据集较小的情况下使模型快速收敛，实现更高的准确率。
 
@@ -112,7 +275,7 @@ python train.py
 
 ![image-20201214203019767](.assets/image-20201214203019767.png)
 
-### 五、测试模型
+#### 3、测试模型
 
 若使用自己训练的模型，需要在根目录的`yolo.py`中修改`model_path`的路径。不过也可以使用这里训练好的[模型-提取码：t9ct](https://pan.baidu.com/s/1bGBd9821KCpcgOTRuHQseg)，下载模型后将模型文件放入`logs`文件夹即可。在`predict.py`中修改`imgPath`为需要预测的图片路径，运行
 
